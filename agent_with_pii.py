@@ -1,310 +1,218 @@
-import re
-import uuid
-import hashlib
-import json
-from typing import Dict, List, Any, Tuple, Optional
-from dataclasses import dataclass, asdict
-from enum import Enum
-import logging
-
-logger = logging.getLogger(__name__)
-
-class PIIType(Enum):
-    EMAIL = "email"
-    PHONE = "phone"
-    SSN = "ssn"
-    CREDIT_CARD = "credit_card"
-    IP_ADDRESS = "ip_address"
-    NAME = "name"
-    ADDRESS = "address"
-    USER_ID = "user_id"
-    TICKET_ID = "ticket_id"
-    CUSTOM = "custom"
-
-@dataclass
-class PIIEntity:
-    original_value: str
-    anonymized_value: str
-    pii_type: PIIType
-    context: Optional[str] = None
-
-class PIIAnonymizer:
-    """
-    Comprehensive PII anonymization system that detects, anonymizes, stores mappings,
-    and can deanonymize data for MCP server responses.
-    """
-    
-    def __init__(self):
-        self.entity_map: Dict[str, PIIEntity] = {}
-        self.reverse_map: Dict[str, str] = {}  # anonymized -> original
-        self.patterns = self._initialize_patterns()
-        
-    def _initialize_patterns(self) -> Dict[PIIType, re.Pattern]:
-        """Initialize regex patterns for different PII types"""
-        return {
-            PIIType.EMAIL: re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'),
-            PIIType.PHONE: re.compile(r'\b(?:\+?1[-.\s]?)?\(?([0-9]{3})\)?[-.\s]?([0-9]{3})[-.\s]?([0-9]{4})\b'),
-            PIIType.SSN: re.compile(r'\b\d{3}-?\d{2}-?\d{4}\b'),
-            PIIType.CREDIT_CARD: re.compile(r'\b(?:\d{4}[-\s]?){3}\d{4}\b'),
-            PIIType.IP_ADDRESS: re.compile(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'),
-            # Common name patterns (basic - you may want to enhance this)
-            PIIType.NAME: re.compile(r'\b[A-Z][a-z]+ [A-Z][a-z]+\b'),
-            # JIRA ticket IDs
-            PIIType.TICKET_ID: re.compile(r'\b[A-Z]+-\d+\b'),
-            # User IDs (alphanumeric)
-            PIIType.USER_ID: re.compile(r'\buser[_-]?\d+\b|\b[a-z]+\.\d+\b', re.IGNORECASE),
-        }
-    
-    def _generate_anonymized_value(self, original: str, pii_type: PIIType) -> str:
-        """Generate anonymized replacement value based on PII type"""
-        # Use consistent hashing for same values
-        hash_obj = hashlib.md5(original.encode())
-        hash_hex = hash_obj.hexdigest()[:8]
-        
-        if pii_type == PIIType.EMAIL:
-            return f"user_{hash_hex}@example.com"
-        elif pii_type == PIIType.PHONE:
-            return f"555-{hash_hex[:3]}-{hash_hex[3:7]}"
-        elif pii_type == PIIType.SSN:
-            return f"XXX-XX-{hash_hex[:4]}"
-        elif pii_type == PIIType.CREDIT_CARD:
-            return f"****-****-****-{hash_hex[:4]}"
-        elif pii_type == PIIType.IP_ADDRESS:
-            return f"192.168.1.{int(hash_hex[:2], 16) % 255}"
-        elif pii_type == PIIType.NAME:
-            return f"Person_{hash_hex[:6]}"
-        elif pii_type == PIIType.TICKET_ID:
-            return f"ANON-{hash_hex[:6]}"
-        elif pii_type == PIIType.USER_ID:
-            return f"user_{hash_hex[:8]}"
-        else:
-            return f"ANON_{hash_hex}"
-    
-    def _detect_and_anonymize_match(self, match: re.Match, pii_type: PIIType, context: str = None) -> str:
-        """Process a regex match and return anonymized version"""
-        original_value = match.group()
-        
-        # Check if we already have this value anonymized
-        if original_value in self.entity_map:
-            return self.entity_map[original_value].anonymized_value
-        
-        # Generate new anonymized value
-        anonymized_value = self._generate_anonymized_value(original_value, pii_type)
-        
-        # Store the mapping
-        entity = PIIEntity(
-            original_value=original_value,
-            anonymized_value=anonymized_value,
-            pii_type=pii_type,
-            context=context
-        )
-        
-        self.entity_map[original_value] = entity
-        self.reverse_map[anonymized_value] = original_value
-        
-        logger.info(f"Anonymized {pii_type.value}: {original_value} -> {anonymized_value}")
-        return anonymized_value
-    
-    def anonymize_text(self, text: str, context: str = None) -> str:
-        """Anonymize PII in text using regex patterns"""
-        if not isinstance(text, str):
-            return text
-            
-        anonymized_text = text
-        
-        for pii_type, pattern in self.patterns.items():
-            def replace_func(match):
-                return self._detect_and_anonymize_match(match, pii_type, context)
-            
-            anonymized_text = pattern.sub(replace_func, anonymized_text)
-        
-        return anonymized_text
-    
-    def anonymize_data_structure(self, data: Any, context: str = None) -> Any:
-        """Recursively anonymize PII in complex data structures"""
-        if isinstance(data, str):
-            return self.anonymize_text(data, context)
-        elif isinstance(data, dict):
-            return {
-                key: self.anonymize_data_structure(value, f"{context}.{key}" if context else key)
-                for key, value in data.items()
-            }
-        elif isinstance(data, list):
-            return [
-                self.anonymize_data_structure(item, f"{context}[{i}]" if context else f"item_{i}")
-                for i, item in enumerate(data)
-            ]
-        elif isinstance(data, tuple):
-            return tuple(
-                self.anonymize_data_structure(item, f"{context}[{i}]" if context else f"item_{i}")
-                for i, item in enumerate(data)
-            )
-        else:
-            return data
-    
-    def deanonymize_text(self, text: str) -> str:
-        """Restore original PII values in anonymized text"""
-        if not isinstance(text, str):
-            return text
-            
-        deanonymized_text = text
-        
-        # Replace anonymized values with original ones
-        for anonymized_value, original_value in self.reverse_map.items():
-            deanonymized_text = deanonymized_text.replace(anonymized_value, original_value)
-        
-        return deanonymized_text
-    
-    def deanonymize_data_structure(self, data: Any) -> Any:
-        """Recursively deanonymize data structures"""
-        if isinstance(data, str):
-            return self.deanonymize_text(data)
-        elif isinstance(data, dict):
-            return {key: self.deanonymize_data_structure(value) for key, value in data.items()}
-        elif isinstance(data, list):
-            return [self.deanonymize_data_structure(item) for item in data]
-        elif isinstance(data, tuple):
-            return tuple(self.deanonymize_data_structure(item) for item in data)
-        else:
-            return data
-    
-    def get_entity_map(self) -> Dict[str, Dict]:
-        """Get serializable entity map for storage/logging"""
-        return {
-            original: asdict(entity) for original, entity in self.entity_map.items()
-        }
-    
-    def clear_session_data(self):
-        """Clear anonymization data for new session"""
-        self.entity_map.clear()
-        self.reverse_map.clear()
-    
-    def add_custom_pattern(self, pii_type: PIIType, pattern: str):
-        """Add custom regex pattern for specific PII detection"""
-        self.patterns[pii_type] = re.compile(pattern)
-
-class AnonymizedMCPToolWrapper:
-    """
-    Wrapper for MCP tools that handles anonymization/deanonymization automatically
-    """
-    
-    def __init__(self, original_tool, anonymizer: PIIAnonymizer):
-        self.original_tool = original_tool
-        self.anonymizer = anonymizer
-        self.name = original_tool.name
-        self.description = original_tool.description
-        self.args_schema = original_tool.args_schema
-    
-    async def __call__(self, *args, **kwargs):
-        """Execute tool with anonymization/deanonymization"""
-        # Log original request (be careful with logging PII in production)
-        logger.debug(f"Original tool call: {self.name} with args: {args}, kwargs: {kwargs}")
-        
-        # Don't anonymize the input to the tool - tools need real data to work
-        # Instead, we'll anonymize the output from the tool before sending to LLM
-        try:
-            # Execute the original tool
-            result = await self.original_tool(*args, **kwargs)
-            
-            # Anonymize the result before it goes to the LLM
-            anonymized_result = self.anonymizer.anonymize_data_structure(
-                result, 
-                context=f"tool_{self.name}"
-            )
-            
-            logger.debug(f"Anonymized tool result for LLM: {anonymized_result}")
-            
-            return anonymized_result
-            
-        except Exception as e:
-            logger.error(f"Error in tool {self.name}: {e}")
-            raise
-
-def create_anonymized_tools(tools: List[Any], anonymizer: PIIAnonymizer) -> List[AnonymizedMCPToolWrapper]:
-    """Create anonymized versions of MCP tools"""
-    return [AnonymizedMCPToolWrapper(tool, anonymizer) for tool in tools]
-
-
-# Modified FastAPI integration
 import asyncio
+import logging
+from contextlib import AsyncExitStack
+from typing import Dict, List, Any, Optional
+
+# MCP and Langchain imports
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from langchain_mcp_adapters.tools import load_mcp_tools
 from tachyon_langchain_client import TachyonLangchainClient
 from langgraph.prebuilt import create_react_agent
-from contextlib import AsyncExitStack
 
-# --- FastAPI Imports ---
-from fastapi import FastAPI, HTTPException
+# FastAPI imports
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 import uvicorn
 
-# --- Global Variables ---
+# Import the PII anonymization system
+from your_anonymization_module import PIIAnonymizer, AnonymizedMCPToolWrapper, create_anonymized_tools
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Global variables
 global_agent = None
 global_mcp_exit_stack = None
 global_anonymizer = None
+global_mcp_sessions = []
 
-# --- FastAPI App Initialization ---
 app = FastAPI(
-    title="Anonymized MCP Langchain Agent API",
-    description="API with PII anonymization for MCP and Langchain integration.",
-    version="1.0.0"
+    title="Fixed Anonymized MCP Langchain Agent API",
+    description="Fixed version with proper async context management",
+    version="1.0.1"
 )
 
 model_client = TachyonLangchainClient(model_name="gemini-2.5-flash")
 
+class MCPServerManager:
+    """Manages MCP server connections with proper error handling"""
+    
+    def __init__(self):
+        self.sessions = []
+        self.exit_stack = None
+        self.tools = []
+    
+    async def initialize_server(self, name: str, params: StdioServerParameters) -> List[Any]:
+        """Initialize a single MCP server with error handling"""
+        try:
+            logger.info(f"Initializing MCP server: {name}")
+            
+            # Create stdio client with timeout
+            read_pipe, write_pipe = await asyncio.wait_for(
+                stdio_client(params),
+                timeout=30.0  # 30 second timeout
+            )
+            
+            # Create and initialize session
+            session = ClientSession(read_pipe, write_pipe)
+            await asyncio.wait_for(
+                session.initialize(),
+                timeout=10.0  # 10 second timeout for initialization
+            )
+            
+            # Load tools from this server
+            tools = await asyncio.wait_for(
+                load_mcp_tools(session),
+                timeout=15.0  # 15 second timeout for loading tools
+            )
+            
+            # Store session for cleanup
+            self.sessions.append({
+                'name': name,
+                'session': session,
+                'read_pipe': read_pipe,
+                'write_pipe': write_pipe,
+                'tools': tools
+            })
+            
+            logger.info(f"Successfully loaded {len(tools)} tools from {name}")
+            return tools
+            
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout initializing MCP server: {name}")
+            return []
+        except Exception as e:
+            logger.error(f"Error initializing MCP server {name}: {e}")
+            return []
+    
+    async def initialize_all_servers(self) -> List[Any]:
+        """Initialize all MCP servers concurrently with error handling"""
+        server_configs = [
+            ("custom_mcp_jira", StdioServerParameters(
+                command="python", 
+                args=["-m", "custom_mcp_jira.__main__"]
+            )),
+            ("jenkins_mcp", StdioServerParameters(
+                command="python", 
+                args=["-m", "jenkins_mcp.__main__"]
+            )),
+            ("KB_mcp", StdioServerParameters(
+                command="python", 
+                args=["-m", "KB_mcp.__main__"]
+            )),
+        ]
+        
+        all_tools = []
+        
+        # Initialize servers one by one to avoid async context conflicts
+        for name, params in server_configs:
+            try:
+                tools = await self.initialize_server(name, params)
+                all_tools.extend(tools)
+            except Exception as e:
+                logger.error(f"Failed to initialize {name}: {e}")
+                # Continue with other servers even if one fails
+                continue
+        
+        logger.info(f"Total tools loaded from all servers: {len(all_tools)}")
+        return all_tools
+    
+    async def cleanup(self):
+        """Clean up all MCP sessions"""
+        logger.info("Cleaning up MCP sessions...")
+        
+        for session_info in self.sessions:
+            try:
+                name = session_info['name']
+                session = session_info['session']
+                
+                logger.info(f"Closing session for {name}")
+                
+                # Close session gracefully
+                if hasattr(session, 'close'):
+                    await session.close()
+                
+                # Close pipes
+                read_pipe = session_info.get('read_pipe')
+                write_pipe = session_info.get('write_pipe')
+                
+                if read_pipe and hasattr(read_pipe, 'close'):
+                    await read_pipe.close()
+                if write_pipe and hasattr(write_pipe, 'close'):
+                    await write_pipe.close()
+                    
+            except Exception as e:
+                logger.error(f"Error cleaning up session {session_info['name']}: {e}")
+        
+        self.sessions.clear()
+        logger.info("MCP cleanup completed")
+
+# Global MCP manager
+mcp_manager = MCPServerManager()
+
 async def initialize_mcp_environment():
-    """
-    Sets up MCP sessions with PII anonymization
-    """
-    global global_agent, global_mcp_exit_stack, global_anonymizer
+    """Initialize MCP environment with improved error handling"""
+    global global_agent, global_anonymizer
     
-    # Initialize anonymizer
-    global_anonymizer = PIIAnonymizer()
-    
-    server_configs = [
-        ("custom_mcp_jira", StdioServerParameters(command="python", args=["-m", "custom_mcp_jira.__main__"])),
-        ("jenkins_mcp", StdioServerParameters(command="python", args=["-m", "jenkins_mcp.__main__"])),
-        ("KB_mcp", StdioServerParameters(command="python", args=["-m", "KB_mcp.__main__"])),
-    ]
-    
-    all_tools_list = []
-    
-    # Initialize the global AsyncExitStack
-    global_mcp_exit_stack = AsyncExitStack()
-    await global_mcp_exit_stack.__aenter__()
-    
-    for name, params in server_configs:
-        print(f"Loading tools from {name}...")
+    try:
+        logger.info("Starting MCP environment initialization...")
         
-        read_pipe, write_pipe = await global_mcp_exit_stack.enter_async_context(stdio_client(params))
-        session = await global_mcp_exit_stack.enter_async_context(ClientSession(read_pipe, write_pipe))
-        await session.initialize()
+        # Initialize anonymizer
+        global_anonymizer = PIIAnonymizer()
+        logger.info("PII Anonymizer initialized")
         
-        tools = await load_mcp_tools(session)
+        # Initialize all MCP servers
+        all_tools = await mcp_manager.initialize_all_servers()
         
-        # Wrap tools with anonymization
-        anonymized_tools = create_anonymized_tools(tools, global_anonymizer)
-        all_tools_list.extend(anonymized_tools)
+        if not all_tools:
+            logger.warning("No tools were loaded from any MCP server")
+            # You might want to continue with a limited agent or raise an exception
+            raise HTTPException(
+                status_code=503, 
+                detail="No MCP tools available - check server configurations"
+            )
         
-        print(f"Loaded {len(tools)} anonymized tools from {name}.")
-    
-    print(f"Total anonymized tools loaded: {len(all_tools_list)}")
-    global_agent = create_react_agent(model_client, all_tools_list)
-    print("Anonymized agent initialized successfully.")
+        # Create anonymized tools
+        anonymized_tools = create_anonymized_tools(all_tools, global_anonymizer)
+        logger.info(f"Created {len(anonymized_tools)} anonymized tool wrappers")
+        
+        # Create the agent
+        global_agent = create_react_agent(model_client, anonymized_tools)
+        logger.info("Langchain ReAct agent created successfully")
+        
+        logger.info("MCP environment initialization completed successfully")
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize MCP environment: {e}")
+        # Clean up any partially initialized resources
+        await mcp_manager.cleanup()
+        raise
 
 @app.on_event("startup")
 async def startup_event():
-    print("FastAPI startup event triggered. Initializing anonymized MCP environment...")
-    await initialize_mcp_environment()
+    """FastAPI startup event with better error handling"""
+    try:
+        logger.info("FastAPI startup event triggered")
+        await initialize_mcp_environment()
+        logger.info("Application startup completed successfully")
+    except Exception as e:
+        logger.error(f"Application startup failed: {e}")
+        # You might want to exit the application here
+        # import sys
+        # sys.exit(1)
+        raise
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    print("FastAPI shutdown event triggered. Cleaning up...")
-    global global_mcp_exit_stack
-    if global_mcp_exit_stack:
-        await global_mcp_exit_stack.__aexit__(None, None, None)
-    print("MCP environment cleaned up.")
+    """FastAPI shutdown event"""
+    try:
+        logger.info("FastAPI shutdown event triggered")
+        await mcp_manager.cleanup()
+        logger.info("Application shutdown completed")
+    except Exception as e:
+        logger.error(f"Error during shutdown: {e}")
 
 class AgentInput(BaseModel):
     message: str
@@ -313,62 +221,98 @@ class AgentInput(BaseModel):
 class AgentResponse(BaseModel):
     response: Any
     anonymization_stats: Dict[str, int]
+    status: str = "success"
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    global global_agent, global_anonymizer
+    
+    status = {
+        "status": "healthy" if global_agent and global_anonymizer else "initializing",
+        "agent_ready": global_agent is not None,
+        "anonymizer_ready": global_anonymizer is not None,
+        "active_sessions": len(mcp_manager.sessions),
+        "available_tools": len(mcp_manager.sessions)
+    }
+    
+    if not global_agent:
+        status["status"] = "unhealthy"
+        status["message"] = "Agent not initialized"
+    
+    return status
 
 @app.post("/invoke_agent", response_model=AgentResponse)
 async def invoke_agent_endpoint(input_data: AgentInput):
-    """
-    Invoke agent with PII anonymization/deanonymization
-    """
+    """Invoke agent with improved error handling"""
     global global_agent, global_anonymizer
     
-    if global_agent is None or global_anonymizer is None:
+    # Check if services are ready
+    if global_agent is None:
         raise HTTPException(
             status_code=503,
-            detail="Agent not initialized. Please wait for application startup."
+            detail="Agent not initialized. Check /health endpoint for status."
+        )
+    
+    if global_anonymizer is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Anonymizer not initialized. Check /health endpoint for status."
         )
     
     try:
         # Clear previous session data if new session
         if input_data.session_id:
             global_anonymizer.clear_session_data()
+            logger.info(f"Cleared anonymization data for session: {input_data.session_id}")
         
-        # Anonymize input message before sending to LLM
+        # Anonymize input message
         anonymized_message = global_anonymizer.anonymize_text(
             input_data.message, 
             context="user_input"
         )
         
-        print(f"Anonymized user message: {anonymized_message}")
+        logger.info(f"Processing request - Original length: {len(input_data.message)}, "
+                   f"Anonymized length: {len(anonymized_message)}")
         
-        # Invoke agent with anonymized message
-        # The agent will receive anonymized data from tools automatically
-        agent_response = await global_agent.ainvoke({
-            "messages": anonymized_message
-        })
+        # Invoke agent with timeout
+        agent_response = await asyncio.wait_for(
+            global_agent.ainvoke({"messages": anonymized_message}),
+            timeout=120.0  # 2 minute timeout for agent processing
+        )
         
-        print(f"Agent response (anonymized): {agent_response}")
+        logger.info("Agent processing completed")
         
-        # Deanonymize the response before returning to user
+        # Deanonymize the response
         deanonymized_response = global_anonymizer.deanonymize_data_structure(agent_response)
         
         # Get anonymization statistics
         entity_map = global_anonymizer.get_entity_map()
         anonymization_stats = {
-            pii_type.value: sum(1 for entity in entity_map.values() 
-                              if entity['pii_type'] == pii_type.value)
-            for pii_type in PIIType
+            "total_entities": len(entity_map),
+            "emails_anonymized": sum(1 for e in entity_map.values() if e.pii_type.value == "email"),
+            "phones_anonymized": sum(1 for e in entity_map.values() if e.pii_type.value == "phone"),
+            "tickets_anonymized": sum(1 for e in entity_map.values() if e.pii_type.value == "ticket_id"),
+            "names_anonymized": sum(1 for e in entity_map.values() if e.pii_type.value == "name"),
         }
         
         return AgentResponse(
             response=deanonymized_response,
-            anonymization_stats=anonymization_stats
+            anonymization_stats=anonymization_stats,
+            status="success"
         )
         
+    except asyncio.TimeoutError:
+        logger.error("Agent processing timeout")
+        raise HTTPException(
+            status_code=504,
+            detail="Agent processing timeout. Please try again with a simpler request."
+        )
     except Exception as e:
-        logger.error(f"Error in anonymized agent call: {e}")
+        logger.error(f"Error in agent processing: {e}")
         raise HTTPException(
             status_code=500,
-            detail=f"An error occurred: {str(e)}"
+            detail=f"Agent processing error: {str(e)}"
         )
 
 @app.get("/anonymization_stats")
@@ -379,19 +323,59 @@ async def get_anonymization_stats():
     if global_anonymizer is None:
         raise HTTPException(status_code=503, detail="Anonymizer not initialized")
     
-    entity_map = global_anonymizer.get_entity_map()
+    try:
+        entity_map = global_anonymizer.get_entity_map()
+        
+        stats = {
+            "total_entities": len(entity_map),
+            "by_type": {},
+            "session_active": len(entity_map) > 0
+        }
+        
+        # Count by PII type
+        for entity in entity_map.values():
+            pii_type = entity['pii_type']
+            stats["by_type"][pii_type] = stats["by_type"].get(pii_type, 0) + 1
+        
+        return stats
+        
+    except Exception as e:
+        logger.error(f"Error getting anonymization stats: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error retrieving statistics: {str(e)}"
+        )
+
+@app.post("/clear_session")
+async def clear_session():
+    """Clear current anonymization session"""
+    global global_anonymizer
     
-    stats = {
-        "total_entities": len(entity_map),
-        "by_type": {
-            pii_type.value: sum(1 for entity in entity_map.values() 
-                              if entity['pii_type'] == pii_type.value)
-            for pii_type in PIIType
-        },
-        "entities": list(entity_map.values())  # Be careful with this in production
-    }
+    if global_anonymizer is None:
+        raise HTTPException(status_code=503, detail="Anonymizer not initialized")
     
-    return stats
+    try:
+        entities_cleared = len(global_anonymizer.entity_map)
+        global_anonymizer.clear_session_data()
+        
+        return {
+            "status": "success",
+            "entities_cleared": entities_cleared,
+            "message": f"Cleared {entities_cleared} anonymized entities"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error clearing session: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error clearing session: {str(e)}"
+        )
 
 if __name__ == "__main__":
-    uvicorn.run("anonymized_mcp_agent:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(
+        "fixed_mcp_agent:app", 
+        host="0.0.0.0", 
+        port=8000, 
+        reload=False,  # Disable reload to avoid async context issues
+        log_level="info"
+    )
